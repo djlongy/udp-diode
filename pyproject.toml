@@ -1,0 +1,23 @@
+[project]
+name = "udp-diode"
+version = "0.1.0"
+description = "DIO1 one-way UDP file transfer lab protocol (pitcher/catcher, FEC, quarantine)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Newen Systems" }]
+keywords = ["data-diode", "udp", "one-way", "fec", "transfer"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Networking",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
