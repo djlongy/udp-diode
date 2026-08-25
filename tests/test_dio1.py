@@ -250,3 +250,141 @@ def test_stream_stats_and_iter_match_in_memory(tmp_path: Path) -> None:
     data_n = sum(1 for f in frames if f.type is FrameType.DATA)
     assert data_n == nchunks
     assert last == len(data) % 500 or 500
+
+
+def test_status_frame_roundtrip_and_hmac() -> None:
+    from protocol import (
+        STATUS_HOLES,
+        StatusReport,
+        build_status_frame,
+        decode_frame,
+        status_report_from_frame,
+        verify_status_hmac,
+    )
+
+    report = StatusReport(
+        transfer_id="t-status",
+        kind=STATUS_HOLES,
+        have=3,
+        total_chunks=8,
+        missing=(1, 4, 5),
+    )
+    secret = b"validate-track"
+    frame = build_status_frame(report, hmac_secret=secret)
+    restored = decode_frame(frame.encode())
+    assert restored.type is FrameType.STATUS
+    got = status_report_from_frame(restored)
+    assert got.missing == (1, 4, 5)
+    assert verify_status_hmac(secret, got, str(restored.header["hmac"]))
+    assert not verify_status_hmac(secret, got, "0" * 64)
+
+
+def test_data_catcher_writes_holes_then_ok(tmp_path: Path, payload: bytes) -> None:
+    from protocol import STATUS_HOLES, STATUS_OK, build_transfer_frames
+    from receipts import ReceiptStore
+
+    frames = build_transfer_frames("holes1", payload, chunk_size=400)
+    store = ReceiptStore(tmp_path / "receipts")
+    c = Catcher(tmp_path / "out", tmp_path / "q", ttl_s=60, idle_exit_s=None)
+    c.receipts = store
+    c.receipt_every = 0
+    dropped = None
+    for f in frames:
+        if f.type is FrameType.DATA and f.header["seq"] == 1:
+            dropped = f
+            continue
+        c.handle(f.encode())
+    assert c.stats["published"] == 0
+    report = store.read("holes1")
+    assert report is not None
+    assert report.kind == STATUS_HOLES
+    assert 1 in report.missing
+    assert dropped is not None
+    c.handle(dropped.encode())
+    assert c.stats["published"] == 1
+    done = store.read("holes1")
+    assert done is not None
+    assert done.kind == STATUS_OK
+    assert done.missing == ()
+
+
+def test_data_catcher_ignores_status_frames(tmp_path: Path, payload: bytes) -> None:
+    from protocol import STATUS_HOLES, StatusReport, build_status_frame, build_transfer_frames
+
+    frames = build_transfer_frames("ign", payload, chunk_size=400)
+    status = build_status_frame(
+        StatusReport("ign", STATUS_HOLES, have=0, total_chunks=2, missing=(0,))
+    )
+    c = Catcher(tmp_path / "out", tmp_path / "q", ttl_s=60, idle_exit_s=None)
+    c.handle(status.encode())
+    for f in frames:
+        c.handle(f.encode())
+    assert c.stats["status_ignored"] >= 1
+    assert c.stats["published"] == 1
+
+
+def test_status_only_catcher_writes_receipt_ignores_data(
+    tmp_path: Path, payload: bytes
+) -> None:
+    from protocol import STATUS_OK, StatusReport, build_status_frame, build_transfer_frames
+    from receipts import ReceiptStore
+
+    store = ReceiptStore(tmp_path / "receipts")
+    c = Catcher(tmp_path / "out", tmp_path / "q", ttl_s=60, idle_exit_s=None)
+    c.receipts = store
+    c.status_only = True
+    data = build_transfer_frames("sx", payload, chunk_size=400)
+    for f in data:
+        c.handle(f.encode())
+    assert c.stats["published"] == 0
+    assert c.stats["status_ignored"] >= 1
+    frame = build_status_frame(
+        StatusReport("sx", STATUS_OK, have=4, total_chunks=4, missing=())
+    )
+    c.handle(frame.encode())
+    got = store.read("sx")
+    assert got is not None
+    assert got.kind == STATUS_OK
+
+
+def test_coordinator_strips_unknown_keys(tmp_path: Path) -> None:
+    import json as json_mod
+
+    from coordinator import copy_once
+
+    src = tmp_path / "from"
+    dst = tmp_path / "to"
+    src.mkdir()
+    (src / "t1.json").write_text(
+        '{"transfer_id":"t1","kind":"holes","have":1,'
+        '"total_chunks":3,"missing":[2],'
+        '"hostname":"high-side-secret","error":"traceback"}\n'
+    )
+    n = copy_once(src, dst)
+    assert n == 1
+    body = json_mod.loads((dst / "t1.json").read_text())
+    assert body["missing"] == [2]
+    assert "hostname" not in body
+    assert "error" not in body
+
+
+def test_integrity_fail_writes_fail_receipt(tmp_path: Path, payload: bytes) -> None:
+    from protocol import Frame, STATUS_FAIL, build_transfer_frames
+    from receipts import ReceiptStore
+
+    frames = build_transfer_frames("bad2", payload, chunk_size=400)
+    data_i = next(i for i, f in enumerate(frames) if f.type is FrameType.DATA)
+    bad_body = bytearray(frames[data_i].body)
+    bad_body[0] ^= 0xFF
+    frames[data_i] = Frame(
+        type=FrameType.DATA, header=frames[data_i].header, body=bytes(bad_body)
+    )
+    store = ReceiptStore(tmp_path / "receipts")
+    c = Catcher(tmp_path / "out", tmp_path / "q", ttl_s=60, idle_exit_s=None)
+    c.receipts = store
+    for f in frames:
+        c.handle(f.encode())
+    report = store.read("bad2")
+    assert report is not None
+    assert report.kind == STATUS_FAIL
+    assert report.reason == "integrity"

@@ -84,6 +84,70 @@ PORT=$((PORT + 1))
 run_case wire_crc_drop quarantine --wire-corrupt --passes 1 --parity-group 0 --chunk-size 512
 PORT=$((PORT + 1))
 
+# Dual track: data host pair and validate host pair never share a socket.
+# Four send-xor-receive processes + two same-side coordinators (drop dirs).
+# Deterministic hole (drop-seq 1, no FEC) is filled via receipts, not a reverse bind.
+{
+  name="dual_track_arq"
+  expect="publish"
+  out="$WORKDIR/$name/out"
+  quar="$WORKDIR/$name/quar"
+  mkdir -p "$out" "$quar"
+  HIGH_OUT="$WORKDIR/$name/high_out"
+  HIGH_IN="$WORKDIR/$name/high_in"
+  LOW_OUT="$WORKDIR/$name/low_out"
+  LOW_IN="$WORKDIR/$name/low_in"
+  SOURCES="$WORKDIR/$name/sources"
+  mkdir -p "$HIGH_OUT" "$HIGH_IN" "$LOW_OUT" "$LOW_IN" "$SOURCES"
+  DATA_PORT="$PORT"
+  VAL_PORT=$((PORT + 1))
+  $PY catcher.py --bind 127.0.0.1 --port "$DATA_PORT" --out "$out" --quarantine "$quar" \
+    --ttl 6 --idle-exit 3 --max-seconds 20 --receipts "$HIGH_OUT" --receipt-every 0 \
+    >"$WORKDIR/$name.data.catcher.json" 2>"$WORKDIR/$name.data.catcher.log" &
+  dcpid=$!
+  $PY catcher.py --bind 127.0.0.1 --port "$VAL_PORT" --out "$WORKDIR/$name/val_out" \
+    --quarantine "$WORKDIR/$name/val_q" --ttl 6 --idle-exit 3 --max-seconds 20 \
+    --receipts "$LOW_OUT" --status-only \
+    >"$WORKDIR/$name.val.catcher.json" 2>"$WORKDIR/$name.val.catcher.log" &
+  vcpid=$!
+  $PY coordinator.py --from-dir "$HIGH_OUT" --to-dir "$HIGH_IN" --interval 0.1 \
+    --max-seconds 20 >"$WORKDIR/$name.high.coord.log" 2>&1 &
+  hcopid=$!
+  $PY coordinator.py --from-dir "$LOW_OUT" --to-dir "$LOW_IN" --interval 0.1 \
+    --max-seconds 20 >"$WORKDIR/$name.low.coord.log" 2>&1 &
+  lcopid=$!
+  $PY pitcher.py --send-receipts "$HIGH_IN" --host 127.0.0.1 --port "$VAL_PORT" \
+    --receipt-copies 2 --receipt-poll 0.1 --max-seconds 20 --idle-exit 3 \
+    >"$WORKDIR/$name.val.pitcher.log" 2>&1 &
+  vppid=$!
+  sleep 0.4
+  $PY pitcher.py "$SRC" --host 127.0.0.1 --port "$DATA_PORT" --passes 1 --chunk-size 512 \
+    --drop-seq 1 --parity-group 0 --watch-receipts "$LOW_IN" --source-map "$SOURCES" \
+    --ack-timeout-s 0.4 --ack-rounds 12 --ack-backoff 1.5 \
+    >"$WORKDIR/$name.tid" 2>"$WORKDIR/$name.data.pitcher.log"
+  wait "$dcpid" || true
+  wait "$vcpid" || true
+  wait "$hcopid" || true
+  wait "$lcopid" || true
+  wait "$vppid" || true
+  published=$(find "$out" -name '*.bin' ! -name '*.part' 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$published" -ge 1 ]]; then
+    got="$($PY -c "import hashlib,glob,sys; p=glob.glob(sys.argv[1]+'/*.bin'); print(hashlib.sha256(open(p[0],'rb').read()).hexdigest())" "$out")"
+    if [[ "$got" == "$SRC_SHA" ]]; then
+      echo "OK  $name (published via separate validate track, sha256 match)"
+      pass=$((pass + 1))
+    else
+      echo "FAIL $name published but sha mismatch"
+      fail=$((fail + 1))
+    fi
+  else
+    echo "FAIL $name expected publish via dual-track ARQ, published=$published"
+    tail -8 "$WORKDIR/$name.data.catcher.log" "$WORKDIR/$name.data.pitcher.log" 2>/dev/null || true
+    fail=$((fail + 1))
+  fi
+  PORT=$((PORT + 2))
+}
+
 # Soft diode: pitcher → relay (one-way) → catcher. No reverse path on the relay.
 {
   name="soft_diode"

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Low-side pitcher: file → sequenced UDP frames (one-way; no ACK).
+"""Send-only UDP pitcher: file → sequenced frames, or receipts → STATUS.
+
+Never binds a receive socket. Retransmit is driven by local receipt files
+that a same-side coordinator copied from the validate-track catcher.
 
 Absorbs industry practice (godiode / UDPcast / svenseeberg):
   - stream large files (no full-file RAM)
@@ -7,7 +10,7 @@ Absorbs industry practice (godiode / UDPcast / svenseeberg):
   - META/EOF redundancy (default ×3)
   - XOR FEC groups
   - send-side bitrate throttle + SO_SNDBUF
-  - optional HMAC on META
+  - optional HMAC on META / STATUS
 """
 from __future__ import annotations
 
@@ -17,18 +20,25 @@ import socket
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from protocol import (  # noqa: I001
     DEFAULT_CHUNK_SIZE,
     IN_MEMORY_MAX_BYTES,
+    STATUS_FAIL,
+    STATUS_HOLES,
+    STATUS_OK,
     Frame,
     FrameType,
     build_meta_header,
+    build_status_frame,
     build_transfer_frames,
     file_transfer_stats,
     iter_data_and_parity_from_file,
+    iter_data_seqs_from_file,
 )
+from receipts import ReceiptStore, read_source_map, write_source_map
 
 
 def _configure_send_buf(sock: socket.socket, packet_size: int) -> None:
@@ -40,9 +50,166 @@ def _configure_send_buf(sock: socket.socket, packet_size: int) -> None:
         print(f"warn: SO_SNDBUF={want} failed: {exc}", file=sys.stderr)
 
 
+def _send_frame(
+    sock: socket.socket,
+    dest: tuple[str, int],
+    fr: Frame,
+    gap_s: float,
+    max_bps: float,
+) -> int:
+    wire = fr.encode()
+    sock.sendto(wire, dest)
+    sleep_s = gap_s
+    if max_bps > 0:
+        sleep_s = max(sleep_s, len(wire) / max_bps)
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+    return len(wire)
+
+
+def run_validate_pitcher(args: argparse.Namespace) -> int:
+    """Send-only: STATUS frames from a local receipt inbox (validate track)."""
+    store = ReceiptStore(args.send_receipts)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _configure_send_buf(sock, 512)
+    dest = (args.host, args.port)
+    secret = args.hmac_secret.encode("utf-8") if args.hmac_secret else None
+    gap_s = args.gap_ms / 1000.0
+    last_sent: dict[str, str] = {}
+    start = time.time()
+    last_activity = start
+    sent = 0
+    print(
+        f"validate pitcher receipts={args.send_receipts} dest={dest[0]}:{dest[1]}",
+        file=sys.stderr,
+    )
+    try:
+        while True:
+            now = time.time()
+            if args.max_seconds is not None and now - start >= args.max_seconds:
+                break
+            if (
+                args.idle_exit is not None
+                and sent
+                and now - last_activity >= args.idle_exit
+            ):
+                break
+            for _path, report in store.list_reports():
+                token = f"{report.kind}:{report.have}:{report.missing}"
+                if last_sent.get(report.transfer_id) == token:
+                    continue
+                copies = max(1, args.receipt_copies)
+                frame = build_status_frame(report, hmac_secret=secret)
+                for _ in range(copies):
+                    _send_frame(sock, dest, frame, gap_s, 0.0)
+                    sent += 1
+                last_sent[report.transfer_id] = token
+                last_activity = time.time()
+                print(
+                    f"status sent transfer_id={report.transfer_id} "
+                    f"kind={report.kind} have={report.have} "
+                    f"missing={list(report.missing)}",
+                    file=sys.stderr,
+                )
+            time.sleep(max(0.05, args.receipt_poll))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+    print(f"status_frames_sent={sent}", file=sys.stderr)
+    return 0
+
+
+@dataclass
+class ArqJob:
+    transfer_id: str
+    source: Path
+    chunk_size: int
+    meta: Frame
+    eof: Frame
+    receipts: ReceiptStore
+    timeout_s: float = 2.0
+    rounds: int = 8
+    backoff: float = 2.0
+    max_timeout_s: float = 30.0
+    gap_s: float = 0.0
+    max_bps: float = 0.0
+    meta_copies: int = 3
+    eof_copies: int = 3
+
+
+def watch_receipts_and_resend(
+    sock: socket.socket, dest: tuple[str, int], job: ArqJob
+) -> int:
+    """Poll local receipts (validate catcher → coordinator). Send-only."""
+    wait = job.timeout_s
+    last_token = ""
+    for round_i in range(max(1, job.rounds)):
+        deadline = time.time() + wait
+        report = None
+        while time.time() < deadline:
+            report = job.receipts.read(job.transfer_id)
+            if report is not None:
+                break
+            time.sleep(0.05)
+        if report is None:
+            print(
+                f"arq round={round_i + 1}/{job.rounds} no receipt; "
+                f"nudge meta/eof wait={wait:.1f}s",
+                file=sys.stderr,
+            )
+            for _ in range(job.meta_copies):
+                _send_frame(sock, dest, job.meta, job.gap_s, job.max_bps)
+            for _ in range(job.eof_copies):
+                _send_frame(sock, dest, job.eof, job.gap_s, job.max_bps)
+            wait = min(wait * job.backoff, job.max_timeout_s)
+            continue
+        if report.kind == STATUS_OK:
+            print(f"arq ok transfer_id={job.transfer_id}", file=sys.stderr)
+            return 0
+        if report.kind == STATUS_FAIL:
+            print(
+                f"arq fail transfer_id={job.transfer_id} reason={report.reason}",
+                file=sys.stderr,
+            )
+            return 2
+        if report.kind != STATUS_HOLES:
+            wait = min(wait * job.backoff, job.max_timeout_s)
+            continue
+        token = f"{report.kind}:{report.have}:{report.missing}"
+        if token == last_token:
+            time.sleep(wait)
+            wait = min(wait * job.backoff, job.max_timeout_s)
+            continue
+        last_token = token
+        missing = list(report.missing)
+        print(
+            f"arq round={round_i + 1}/{job.rounds} holes={missing} have={report.have}",
+            file=sys.stderr,
+        )
+        for _ in range(job.meta_copies):
+            _send_frame(sock, dest, job.meta, job.gap_s, job.max_bps)
+        for fr in iter_data_seqs_from_file(
+            job.source, job.transfer_id, missing, job.chunk_size
+        ):
+            _send_frame(sock, dest, fr, job.gap_s, job.max_bps)
+        for _ in range(job.eof_copies):
+            _send_frame(sock, dest, job.eof, job.gap_s, job.max_bps)
+        time.sleep(wait)
+        wait = job.timeout_s
+    print(f"arq exhausted transfer_id={job.transfer_id}", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("path", type=Path, help="File to send")
+    p.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="File to send (data track). Omit with --send-receipts.",
+    )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9400)
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -52,7 +219,7 @@ def main() -> int:
         "--passes",
         type=int,
         default=1,
-        help="Full retransmit passes (no ACK path; redundancy only)",
+        help="Full retransmit passes (data track redundancy; validate-track ARQ is --watch-receipts)",
     )
     p.add_argument("--loss", type=float, default=0.0, help="Probability of dropping a DATA frame")
     p.add_argument(
@@ -102,18 +269,47 @@ def main() -> int:
     p.add_argument(
         "--hmac-secret",
         default="",
-        help="If set, sign META with HMAC-SHA256 (must match catcher)",
+        help="If set, sign META/STATUS with HMAC-SHA256 (must match the catcher on this track)",
     )
     p.add_argument(
         "--force-memory",
         action="store_true",
         help="Force in-memory frame build (tests/reorder/corrupt only)",
     )
+    p.add_argument(
+        "--send-receipts",
+        type=Path,
+        default=None,
+        help="Validate track: send STATUS from this inbox. Send-only; no file path.",
+    )
+    p.add_argument("--receipt-copies", type=int, default=3)
+    p.add_argument("--receipt-poll", type=float, default=0.2)
+    p.add_argument("--idle-exit", type=float, default=None)
+    p.add_argument("--max-seconds", type=float, default=None)
+    p.add_argument(
+        "--watch-receipts",
+        type=Path,
+        default=None,
+        help="Data track: after send, poll this inbox for holes/ok/fail and resend. Send-only.",
+    )
+    p.add_argument(
+        "--source-map",
+        type=Path,
+        default=None,
+        help="Directory for {transfer_id}.json mapping to the source file (data track).",
+    )
+    p.add_argument("--ack-timeout-s", type=float, default=2.0)
+    p.add_argument("--ack-rounds", type=int, default=8)
+    p.add_argument("--ack-backoff", type=float, default=2.0)
+    p.add_argument("--ack-timeout-cap-s", type=float, default=30.0)
     args = p.parse_args()
 
+    if args.send_receipts is not None:
+        return run_validate_pitcher(args)
+
     path = args.path
-    if not path.is_file():
-        print(f"not a file: {path}", file=sys.stderr)
+    if path is None or not path.is_file():
+        print("data track requires a file path", file=sys.stderr)
         return 2
 
     size = path.stat().st_size
@@ -127,6 +323,14 @@ def main() -> int:
 
     transfer_id = args.transfer_id or str(uuid.uuid4())
     secret = args.hmac_secret.encode("utf-8") if args.hmac_secret else None
+    if args.source_map is not None:
+        write_source_map(
+            args.source_map,
+            transfer_id,
+            path,
+            args.chunk_size,
+            args.parity_group,
+        )
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _configure_send_buf(sock, args.chunk_size + 256)
     dest = (args.host, args.port)
@@ -274,6 +478,39 @@ def main() -> int:
                 f"sent={sent} dropped_data={dropped} mode=stream",
                 file=sys.stderr,
             )
+
+    if args.watch_receipts is not None:
+        src = path
+        chunk_size = args.chunk_size
+        mapped = None
+        if args.source_map is not None:
+            mapped = read_source_map(args.source_map, transfer_id)
+        if mapped is not None:
+            src = mapped["path"]
+            chunk_size = int(mapped["chunk_size"])
+        rc = watch_receipts_and_resend(
+            sock,
+            dest,
+            ArqJob(
+                transfer_id=transfer_id,
+                source=src,
+                chunk_size=chunk_size,
+                meta=meta,
+                eof=eof,
+                receipts=ReceiptStore(args.watch_receipts),
+                timeout_s=args.ack_timeout_s,
+                rounds=args.ack_rounds,
+                backoff=args.ack_backoff,
+                max_timeout_s=args.ack_timeout_cap_s,
+                gap_s=args.gap_ms / 1000.0,
+                max_bps=max_bps,
+                meta_copies=args.meta_copies,
+                eof_copies=args.eof_copies,
+            ),
+        )
+        sock.close()
+        print(transfer_id)
+        return rc
 
     sock.close()
     print(transfer_id)

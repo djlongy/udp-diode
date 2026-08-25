@@ -3,8 +3,13 @@
 Wire format (big-endian):
   magic(4)=DIO1 | type(1) | flags(1) | header_len(2) | body_len(4) | header_json | body | crc32(4)
 
-Types: META=1, DATA=2, EOF=3, PARITY=4
+Types: META=1, DATA=2, EOF=3, PARITY=4, STATUS=5
 CRC covers everything before the CRC field.
+
+STATUS is the payload of the **validate track** (a second one-way stream,
+high→low). The data track never sends or receives STATUS. Coordinators on
+each side join the two tracks via local drop directories; a host that both
+sends and receives is the exfil anti-pattern.
 
 META is intentionally compact for multi‑GB transfers: fixed ``chunk_size`` +
 ``last_chunk_len`` (not a full ``chunk_lens[]`` array — that blows the 16-bit
@@ -40,6 +45,17 @@ class FrameType(IntEnum):
     DATA = 2
     EOF = 3
     PARITY = 4
+    STATUS = 5
+
+
+# Reverse-channel STATUS kinds. Keep this set closed: the pitcher treats
+# unknown kinds as noise, not as a cue to resend the whole envelope.
+STATUS_HOLES = "holes"
+STATUS_OK = "ok"
+STATUS_FAIL = "fail"
+STATUS_KINDS = frozenset({STATUS_HOLES, STATUS_OK, STATUS_FAIL})
+# Cap the hole list so one STATUS datagram stays under a common MTU.
+STATUS_MISSING_CAP = 64
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,112 @@ def verify_meta_hmac(
 
     want = meta_hmac(secret, transfer_id, total_len, total_chunks, digest)
     return hmac.compare_digest(want, provided or "")
+
+
+@dataclass(frozen=True)
+class StatusReport:
+    """High→low receipt. ``missing`` is the next hole window, not the full gap set."""
+
+    transfer_id: str
+    kind: str
+    have: int
+    total_chunks: int | None = None
+    missing: tuple[int, ...] = ()
+    reason: str | None = None
+
+
+def status_hmac(secret: bytes, report: StatusReport) -> str:
+    """HMAC-SHA256 over stable STATUS fields (authenticity of the reverse channel)."""
+    import hmac
+
+    missing = ",".join(str(s) for s in report.missing)
+    total = "" if report.total_chunks is None else str(report.total_chunks)
+    reason = report.reason or ""
+    msg = (
+        f"{report.transfer_id}|{report.kind}|{report.have}|{total}|{missing}|{reason}"
+    ).encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def verify_status_hmac(secret: bytes, report: StatusReport, provided: str) -> bool:
+    import hmac
+
+    want = status_hmac(secret, report)
+    return hmac.compare_digest(want, provided or "")
+
+
+def build_status_frame(
+    report: StatusReport, hmac_secret: bytes | None = None
+) -> Frame:
+    """Build a STATUS frame. Unknown kinds are rejected at build time."""
+    if report.kind not in STATUS_KINDS:
+        raise ProtocolError(f"unknown status kind {report.kind!r}")
+    missing = tuple(sorted(report.missing)[:STATUS_MISSING_CAP])
+    trimmed = StatusReport(
+        transfer_id=report.transfer_id,
+        kind=report.kind,
+        have=report.have,
+        total_chunks=report.total_chunks,
+        missing=missing,
+        reason=report.reason if report.kind == STATUS_FAIL else None,
+    )
+    header: dict[str, Any] = {
+        "transfer_id": trimmed.transfer_id,
+        "kind": trimmed.kind,
+        "have": trimmed.have,
+        "total_chunks": trimmed.total_chunks,
+        "missing": list(trimmed.missing),
+    }
+    if trimmed.reason:
+        header["reason"] = trimmed.reason
+    if hmac_secret is not None:
+        header["hmac"] = status_hmac(hmac_secret, trimmed)
+    return Frame(type=FrameType.STATUS, header=header)
+
+
+def status_report_from_frame(frame: Frame) -> StatusReport:
+    if frame.type is not FrameType.STATUS:
+        raise ProtocolError(f"not a STATUS frame: {frame.type}")
+    kind = str(frame.header.get("kind", ""))
+    if kind not in STATUS_KINDS:
+        raise ProtocolError(f"unknown status kind {kind!r}")
+    raw_missing = frame.header.get("missing") or []
+    missing = tuple(int(s) for s in raw_missing)[:STATUS_MISSING_CAP]
+    total = frame.header.get("total_chunks")
+    return StatusReport(
+        transfer_id=str(frame.header.get("transfer_id", "")),
+        kind=kind,
+        have=int(frame.header.get("have", 0)),
+        total_chunks=None if total is None else int(total),
+        missing=missing,
+        reason=frame.header.get("reason"),
+    )
+
+
+def iter_data_seqs_from_file(
+    path: Path,
+    transfer_id: str,
+    seqs: list[int],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Iterator[Frame]:
+    """Seek-read selected DATA seqs from a file (ARQ fill; no full RAM)."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    with path.open("rb") as fh:
+        for seq in seqs:
+            fh.seek(seq * chunk_size)
+            body = fh.read(chunk_size)
+            if not body and seq != 0:
+                continue
+            yield Frame(
+                type=FrameType.DATA,
+                header={
+                    "transfer_id": transfer_id,
+                    "seq": seq,
+                    "chunk_len": len(body),
+                },
+                body=body,
+            )
 
 
 def chunk_payload(data: bytes, chunk_size: int) -> list[bytes]:

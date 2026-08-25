@@ -2,7 +2,7 @@
 
 **DIO1** — a lab-grade one-way UDP file transfer protocol (pitcher → catcher).
 
-> **Not a security boundary.** This models sequenced UDP + checksums so you can reason about reorder, loss, FEC, quarantine, and multi‑GB transfers. A true data diode is a *physics* one-way link; applications still own integrity (at-least-once, no reverse ACK).
+> **Not a security boundary.** This models sequenced UDP + checksums so you can reason about reorder, loss, FEC, quarantine, and multi‑GB transfers. A true data diode is a *physics* one-way link; applications still own integrity (at-least-once assembly). A second, independent one-way stream may carry receipts. A host that both sends and receives is the exfil anti-pattern.
 
 ## What you get
 
@@ -10,9 +10,11 @@
 |---|---|
 | `pitcher.py` | Low-side sender (stream multi‑GB, throttle, multi-pass, XOR FEC) |
 | `catcher.py` | High-side reassembler (RAM/mmap, HMAC META, atomic publish / quarantine) |
-| `protocol.py` | Wire format `DIO1` — META / DATA / PARITY / EOF |
+| `protocol.py` | Wire format `DIO1` — META / DATA / PARITY / EOF / STATUS |
+| `receipts.py` | Local receipt JSON (holes / ok / fail). Coordinator language. |
+| `coordinator.py` | Same-side copy of allowlisted receipts. No sockets. |
 | `soft_diode_relay.py` | Optional software one-way hop for local demos |
-| `run_demo.sh` | Loopback scenario matrix (publish / quarantine cases) |
+| `run_demo.sh` | Loopback scenario matrix (publish / quarantine / dual-track ARQ) |
 
 ### Research absorbed
 
@@ -96,7 +98,9 @@ Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full tabl
 | `--reorder` | Shuffle DATA (memory path / small files) |
 | `--corrupt` / `--wire-corrupt` | Integrity / CRC demos |
 | `--parity-group N` | XOR FEC every N DATA chunks |
-| `--passes N` | Full envelope retransmit N times (no ACK path) |
+| `--passes N` | Full envelope retransmit N times (data-track redundancy) |
+| `--send-receipts DIR` | Validate track: send STATUS from a receipt inbox (send-only) |
+| `--watch-receipts DIR` | Data track: poll local inbox for holes/ok/fail and resend |
 | `--meta-copies` / `--eof-copies` | Control-plane redundancy |
 | `--hmac-secret S` | Sign META HMAC-SHA256 |
 | `--max-bitrate X` | Throttle to X Mbit/s |
@@ -113,10 +117,60 @@ Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full tabl
 | `--hmac-secret S` | Require META HMAC |
 | `--idle-exit N` | Exit after idle (**positive only**; ≤0 disables) |
 | `--max-seconds N` | Hard run limit |
+| `--receipts DIR` | Local receipt drop-dir (recv-only; coordinator copies this) |
+| `--status-only` | Validate-track catcher: STATUS frames only |
+
+## Dual track (data ↑, validate ↓)
+
+Two one-way streams that never share a socket, a directory, or a host role.
+A process is send-only **or** receive-only. Production is four hosts
+(`low-tx`, `high-rx`, `high-tx`, `low-rx`). Lab loopback uses four processes
+plus two coordinators.
+
+```text
+LOW                              HIGH
+data-pitcher ──data UDP──► data-catcher      recv-only, writes receipts/
+     send-only                      │ coordinator (files only)
+                                    ▼
+validate-catcher ◄──STATUS── validate-pitcher  send-only
+     recv-only, receipts/          reads inbox/
+          │ coordinator
+          ▼
+data-pitcher watches inbox/ and resends missing DATA only
+```
+
+```bash
+# high-rx
+python3 catcher.py --bind 0.0.0.0 --port 9400 --out /tmp/out \
+  --quarantine /tmp/q --receipts /high/data/out --receipt-every 0
+
+python3 coordinator.py --from-dir /high/data/out --to-dir /high/validate/in
+
+# high-tx
+python3 pitcher.py --send-receipts /high/validate/in \
+  --host LOW_RX_IP --port 9401 --receipt-copies 3
+
+# low-rx
+python3 catcher.py --bind 0.0.0.0 --port 9401 --status-only \
+  --receipts /low/validate/out --out /tmp/val-out --quarantine /tmp/val-q
+
+python3 coordinator.py --from-dir /low/validate/out --to-dir /low/data/in
+
+# low-tx
+python3 pitcher.py /path/to/file.bin --host HIGH_RX_IP --port 9400 \
+  --watch-receipts /low/data/in --source-map /low/data/sources
+```
+
+Packet retry lives in the send-only data pitcher (`--watch-receipts`,
+`--ack-timeout-s`, `--ack-rounds`, `--ack-backoff`). It never binds a
+receive socket. An orchestrator is optional and only drops files next to
+that pitcher.
 
 ## Guarantee modelled
 
-At-least-once assembly with atomic publish and quarantine on integrity/TTL failure. **No high→low ACK** — retransmit is time/redundancy based only.
+At-least-once assembly with atomic publish and quarantine on integrity/TTL
+failure. Without the validate track, retransmit is time/redundancy based only.
+With it, the low-side coordinator resends only the missing seqs.
 
 ## Cross-site helpers
 
