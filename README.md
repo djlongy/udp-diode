@@ -166,6 +166,24 @@ Packet retry lives in the send-only data pitcher (`--watch-receipts`,
 receive socket. An orchestrator is optional and only drops files next to
 that pitcher.
 
+### Loopback bench (8 MiB, induced DATA loss, n=3)
+
+Not a WAN figure. No bitrate cap. Full table:
+[`results/DUAL-VS-SINGLE.md`](results/DUAL-VS-SINGLE.md).
+
+| Loss | single p=1 | single p=2+FEC | dual p=1 | dual p=1+FEC |
+|---:|---|---|---|---|
+| 0% | 3/3, **430 Mbit/s** | 3/3, 116 Mbit/s | 3/3, 205 Mbit/s | 3/3, 118 Mbit/s |
+| 8% | 0/3 | 3/3, **119 Mbit/s** | 3/3, 25 Mbit/s | 3/3, 46 Mbit/s |
+| 15% | 0/3 | 0/3 | 0/3 | 3/3, **26 Mbit/s** |
+
+Dual-track is **not** a line-rate boost. On a clean path, single-pass is
+fastest; dual-track adds receipt lag. At 8% loss it recovers where
+single-pass cannot, but dual-pass+FEC is still faster on loopback
+(second copy is cheaper than many 64-seq hole rounds). At 15%
+independent loss, dual-pass+FEC failed and dual-track+FEC was the only
+mode that published. Re-run: `python3 scripts/bench_dual_vs_single.py`.
+
 ## Guarantee modelled
 
 At-least-once assembly with atomic publish and quarantine on integrity/TTL

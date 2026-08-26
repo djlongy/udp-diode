@@ -1,0 +1,117 @@
+{
+  "size_mb": 8,
+  "reps": 3,
+  "chunk": 1200,
+  "ack_timeout_s": 0.25,
+  "path": "loopback 127.0.0.1, induced pitcher --loss, no bitrate cap",
+  "rows": [
+    {
+      "mode": "single_p1",
+      "loss": 0.0,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 0.149,
+      "mbit_s_med": 430.22,
+      "frames_sent_med": 6997
+    },
+    {
+      "mode": "single_p2_fec4",
+      "loss": 0.0,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 0.553,
+      "mbit_s_med": 115.63,
+      "frames_sent_med": 17490
+    },
+    {
+      "mode": "dual_p1",
+      "loss": 0.0,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 0.312,
+      "mbit_s_med": 205.13,
+      "frames_sent_med": 6997
+    },
+    {
+      "mode": "dual_p1_fec4",
+      "loss": 0.0,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 0.543,
+      "mbit_s_med": 117.9,
+      "frames_sent_med": 8745
+    },
+    {
+      "mode": "single_p1",
+      "loss": 0.08,
+      "ok": "0/3",
+      "ok_n": 0,
+      "wall_s_med": null,
+      "mbit_s_med": null,
+      "frames_sent_med": 6436
+    },
+    {
+      "mode": "single_p2_fec4",
+      "loss": 0.08,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 0.536,
+      "mbit_s_med": 119.4,
+      "frames_sent_med": 16379
+    },
+    {
+      "mode": "dual_p1",
+      "loss": 0.08,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 2.548,
+      "mbit_s_med": 25.12,
+      "frames_sent_med": 6453
+    },
+    {
+      "mode": "dual_p1_fec4",
+      "loss": 0.08,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 1.39,
+      "mbit_s_med": 46.05,
+      "frames_sent_med": 8219
+    },
+    {
+      "mode": "single_p1",
+      "loss": 0.15,
+      "ok": "0/3",
+      "ok_n": 0,
+      "wall_s_med": null,
+      "mbit_s_med": null,
+      "frames_sent_med": 5935
+    },
+    {
+      "mode": "single_p2_fec4",
+      "loss": 0.15,
+      "ok": "0/3",
+      "ok_n": 0,
+      "wall_s_med": null,
+      "mbit_s_med": null,
+      "frames_sent_med": 15377
+    },
+    {
+      "mode": "dual_p1",
+      "loss": 0.15,
+      "ok": "0/3",
+      "ok_n": 0,
+      "wall_s_med": null,
+      "mbit_s_med": null,
+      "frames_sent_med": 5920
+    },
+    {
+      "mode": "dual_p1_fec4",
+      "loss": 0.15,
+      "ok": "3/3",
+      "ok_n": 3,
+      "wall_s_med": 2.425,
+      "mbit_s_med": 26.4,
+      "frames_sent_med": 7681
+    }
+  ]
+}
